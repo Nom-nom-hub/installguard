@@ -1,24 +1,26 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { parseNpmLock } from "./lockfiles.js";
+import { createRegistry, mapLimit } from "./registry.js";
 
 export { readAnyLock } from "./lockfiles.js";
 
-const REGISTRY = process.env.INSTALLGUARD_REGISTRY || "https://registry.npmjs.org";
-
-/** Read name@version pairs from npm's package-lock.json (v2/v3). */
+/** Read name@version pairs from npm's package-lock.json. */
 export async function readLockVersions(projectDir) {
   return parseNpmLock(await readFile(path.join(projectDir, "package-lock.json"), "utf8"));
 }
 
-/** Fetch the publish timestamp of a specific version from the registry. */
-export async function fetchPublishTime(name, version, fetchImpl = fetch) {
-  const res = await fetchImpl(`${REGISTRY}/${name.replace("/", "%2f")}`, {
-    headers: { accept: "application/vnd.npm.install-v1+json" },
-  });
-  if (!res.ok) return null;
-  const body = await res.json();
-  const iso = body?.time?.[version];
+/**
+ * Fetch the publish timestamp of a specific version.
+ *
+ * Must use the FULL packument: the abbreviated document served under the
+ * `install-v1` accept header omits the `time` map entirely.
+ */
+export async function fetchPublishTime(name, version, registryOrFetch = fetch) {
+  const registry =
+    typeof registryOrFetch === "function" ? createRegistry({ fetchImpl: registryOrFetch }) : registryOrFetch;
+  const doc = await registry.packumentFull(name);
+  const iso = doc?.time?.[version];
   return iso ? new Date(iso) : null;
 }
 
@@ -26,28 +28,34 @@ export async function fetchPublishTime(name, version, fetchImpl = fetch) {
  * Flag dependency versions published less than `days` ago — the window in which
  * a compromised release is most likely to still be live (Shai-Hulud-style worms).
  */
-export async function checkCooldown(deps, { days = 7, now = new Date(), concurrency = 8, fetchImpl = fetch } = {}) {
+export async function checkCooldown(
+  deps,
+  { days = 7, now = new Date(), concurrency = 8, fetchImpl = fetch, registry = createRegistry({ fetchImpl }) } = {},
+) {
   const cutoff = now.getTime() - days * 86400000;
   const flagged = [];
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(concurrency, deps.length) }, async () => {
-    while (cursor < deps.length) {
-      const dep = deps[cursor++];
-      let published = null;
-      try {
-        published = await fetchPublishTime(dep.name, dep.version, fetchImpl);
-      } catch {
-        continue;
-      }
-      if (published && published.getTime() > cutoff) {
-        flagged.push({
-          ...dep,
-          published: published.toISOString(),
-          ageHours: Math.round((now.getTime() - published.getTime()) / 3600000),
-        });
-      }
+  let resolved = 0;
+
+  await mapLimit(deps, concurrency, async (dep) => {
+    let published = null;
+    try {
+      published = await fetchPublishTime(dep.name, dep.version, registry);
+    } catch {
+      return;
+    }
+    if (!published) return;
+    resolved++;
+    if (published.getTime() > cutoff) {
+      flagged.push({
+        ...dep,
+        published: published.toISOString(),
+        ageHours: Math.round((now.getTime() - published.getTime()) / 3600000),
+      });
     }
   });
-  await Promise.all(workers);
-  return flagged.sort((a, b) => a.ageHours - b.ageHours);
+
+  flagged.sort((a, b) => a.ageHours - b.ageHours);
+  // `resolved` lets the CLI say "checked 57 of 59" instead of implying full coverage
+  // when the registry was unreachable or a version was unpublished.
+  return Object.assign(flagged, { resolved });
 }

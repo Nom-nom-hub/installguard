@@ -8,16 +8,19 @@ Shai-Hulud worm. npm v12 finally disables install scripts by default, but the tw
 it leaves you with are still manual:
 
 1. *Which of my dependencies actually need a build step, and which are just running code?*
-2. *Am I installing a release that was published minutes ago?*
+2. *What will run if I install this lockfile — before I install it?*
+3. *Am I installing a release that was published minutes ago?*
 
-`installguard` answers both, in one zero-dependency CLI.
+`installguard` answers all three, in one zero-dependency CLI.
 
 ```bash
-npx installguard scan               # what runs code at install time
+npx installguard preflight          # what WILL run — from the lockfile, nothing installed
+npx installguard scan               # what runs code at install time (reads the script files)
 npx installguard allow --write      # block it all except genuine native builds
 npx installguard accept             # record today's hooks as reviewed
 npx installguard diff --ci          # in CI: fail only when that changes
 npx installguard cooldown --days 7  # flag versions published minutes ago
+npx installguard why left-pad       # which direct dep dragged that in
 ```
 
 ## Commands
@@ -52,7 +55,62 @@ summary: 1 high · 1 medium · 1 low
 | `funding-nag` | opencollective/funding banner | low |
 
 Flags: `--json`, `--min-risk low|medium|high`, `--dir <path>`, `--ci` (exit `1` when anything
-at or above `high` — or the level you pass — is found).
+at or above `high` — or the level you pass — is found), `--no-deep`.
+
+#### Deep inspection
+
+Almost every real hook reads `node install.js`. The command string tells you nothing; the
+payload is in the file. So `scan` resolves that file, reads it, and reports the lines that
+matter — with the risk of the *package* upgraded to match its source:
+
+```
+HIGH   esbuild@0.28.2
+       postinstall [network-download] node install.js
+         ⤷ install.js:95 [obfuscated-exec] var child_process = require("child_process");
+         ⤷ install.js:103 [obfuscated-exec] stdout = child_process.execFileSync(command.shift(), …
+         … 8 more match(es) in install.js
+```
+
+That example is *legitimate* — esbuild really does fetch and exec its platform binary. Deep
+inspection tells you what the code does, not whether the author meant well, which is why the
+workflow below is `accept` once and then diff. A hook that points outside its own package
+directory (`node ../../evil.js`) is reported as `path-escape` and never read.
+
+Pass `--no-deep` to classify command strings only.
+
+### `installguard preflight`
+
+The one check that runs *before* anything executes. No `node_modules` needed: it reads your
+lockfile and asks the registry which of those exact versions declare install scripts, then
+pulls the script bodies for only those.
+
+```bash
+installguard preflight --ci     # in CI, or on a lockfile in a pull request
+```
+
+```
+1 of 59 locked versions will run code on install
+
+MEDIUM esbuild@0.28.2
+       postinstall [script-exec] node install.js
+```
+
+`scan` can only tell you what already ran on the machine doing the scanning. `preflight`
+tells a reviewer what a lockfile change is about to do on everyone else's.
+
+### `installguard why <package>`
+
+A flagged transitive dependency is only actionable when you know who asked for it:
+
+```
+sneaky@4.0.0 is here because of:
+
+  app › bundler › helper › sneaky
+
+direct dependenc(ies) to change: bundler
+```
+
+Shortest paths first, from `package-lock.json`.
 
 ### `installguard allow [--write]`
 
@@ -86,7 +144,8 @@ CHANGE esbuild@0.28.2 (script, risk; was 0.28.2)
 ### `installguard cooldown [--days 7]`
 
 Reads your lockfile — `package-lock.json`, `pnpm-lock.yaml` or `yarn.lock` (classic and berry) —
-asks the registry when each locked version was published, and flags
+asks the registry when each locked version was published (from the full packument: the
+abbreviated one npm serves by default has no timestamps at all), and flags
 anything younger than the cooldown window — the period in which a hijacked publish is usually
 still live and unreported.
 
@@ -103,6 +162,7 @@ Use `--ci` to fail a pipeline on fresh releases, or `--json` to feed it into you
 
 ```yaml
 - run: npm ci --ignore-scripts
+- run: npx installguard preflight --ci
 - run: npx installguard diff --ci
 - run: npx installguard cooldown --days 3 --ci
 ```
