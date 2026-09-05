@@ -10,6 +10,9 @@ import { readBaseline, writeBaseline, diffBaseline, BASELINE_FILE } from "./base
 import { inspectFindings } from "./inspect.js";
 import { preflight } from "./preflight.js";
 import { buildGraph, pathsTo, blameDirect } from "./graph.js";
+import { readPolicy, applyPolicy, renderPolicy, POLICY_FILE } from "./policy.js";
+import { toSarif } from "./sarif.js";
+import { writeWorkflow, renderWorkflow, WORKFLOW_PATH } from "./ci.js";
 
 const C = {
   reset: "\u001b[0m",
@@ -50,6 +53,7 @@ Usage
   installguard accept    [--dir <path>]
   installguard preflight [--json] [--ci] [--dir <path>]
   installguard why       <package> [--json] [--dir <path>]
+  installguard ci --init [--node 20] [--force] [--dir <path>]
 
 Commands
   scan      List every dependency with a pre/install/postinstall hook, classified by risk.
@@ -59,11 +63,18 @@ Commands
   accept    Record the current install scripts as reviewed (writes .installguard.json).
   preflight Check a lockfile BEFORE installing — no node_modules required.
   why       Show which of your direct dependencies pulls a package in.
+  ci        Generate a ready-to-commit GitHub Actions workflow (--init).
+  policy    Print a starter policy file from the current tree.
 
 Flags
   --ci        Exit 1 when findings are at or above the threshold (default: high).
   --json      Machine-readable output.
   --no-deep   Skip reading the files behind 'node install.js' (faster, blinder).
+  --sarif     Emit SARIF 2.1.0 (scan, preflight) for GitHub's Security tab.
+  --policy    Path to a policy file (default .installguardrc.json).
+
+Policy: record reviewed packages in .installguardrc.json with a reason and an
+optional expiry. Expired allowances come back as findings instead of lingering.
 
 Typical use: 'accept' once, then 'diff --ci' in CI so you are alerted on change, not volume.
 `;
@@ -95,6 +106,24 @@ function printScan(findings, minRisk) {
   return shown;
 }
 
+async function toolVersion() {
+  try {
+    const { default: pkg } = await import("../package.json", { with: { type: "json" } });
+    return pkg.version;
+  } catch {
+    return "0.0.0";
+  }
+}
+
+function reportPolicy(applied) {
+  if (applied.allowed.length) {
+    console.log(paint("dim", `\n${applied.allowed.length} finding(s) allowed by ${POLICY_FILE}.`));
+  }
+  for (const e of applied.expired) {
+    console.log(paint("yellow", `! allowance for ${e.name} expired on ${e.policy.expires} — re-review or extend it.`));
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const { command, flags } = parseArgs(argv);
   if (flags.help || command === "help" || command === "--help") {
@@ -117,10 +146,19 @@ export async function main(argv = process.argv.slice(2)) {
     if (flags.deep !== false && flags["no-deep"] !== true) findings = await inspectFindings(dir, findings);
     if (command === "scan") {
       const minRisk = typeof flags["min-risk"] === "string" ? flags["min-risk"] : "low";
-      if (flags.json) console.log(JSON.stringify({ findings }, null, 2));
-      else printScan(findings, minRisk);
-      const failAt = typeof flags.ci === "string" ? flags.ci : "high";
-      return flags.ci && findings.some((f) => RISK_ORDER[f.risk] >= RISK_ORDER[failAt]) ? 1 : 0;
+      const policy = await readPolicy(dir, typeof flags.policy === "string" ? flags.policy : undefined);
+      const applied = applyPolicy(findings, policy);
+      if (flags.sarif) {
+        console.log(JSON.stringify(toSarif(applied.remaining, { toolVersion: await toolVersion() }), null, 2));
+        return 0;
+      }
+      if (flags.json) console.log(JSON.stringify({ findings: applied.remaining, allowed: applied.allowed, expired: applied.expired }, null, 2));
+      else {
+        printScan(applied.remaining, minRisk);
+        if (policy.exists) reportPolicy(applied);
+      }
+      const failAt = typeof flags.ci === "string" ? flags.ci : policy.failOn;
+      return flags.ci && applied.remaining.some((f) => RISK_ORDER[f.risk] >= RISK_ORDER[failAt]) ? 1 : 0;
     }
     const list = buildAllowList(findings);
     const config = renderConfig(list);
@@ -158,7 +196,10 @@ export async function main(argv = process.argv.slice(2)) {
       console.error(`installguard: no ${BASELINE_FILE} found — run \`installguard accept\` first.`);
       return 2;
     }
-    const { added, changed, removed } = diffBaseline(findings, baseline);
+    const policy = await readPolicy(dir, typeof flags.policy === "string" ? flags.policy : undefined);
+    let { added, changed, removed } = diffBaseline(findings, baseline);
+    const appliedAdded = applyPolicy(added, policy);
+    added = appliedAdded.remaining;
     if (flags.json) {
       console.log(JSON.stringify({ added, changed, removed }, null, 2));
     } else if (!added.length && !changed.length) {
@@ -217,7 +258,14 @@ export async function main(argv = process.argv.slice(2)) {
       console.error("installguard: no lockfile found (package-lock.json, pnpm-lock.yaml or yarn.lock).");
       return 2;
     }
-    const { checked, unknown, findings } = await preflight(deps);
+    const { checked, unknown, findings: allFindings } = await preflight(deps);
+    const policy = await readPolicy(dir, typeof flags.policy === "string" ? flags.policy : undefined);
+    const applied = applyPolicy(allFindings, policy);
+    const findings = applied.remaining;
+    if (flags.sarif) {
+      console.log(JSON.stringify(toSarif(findings, { toolVersion: await toolVersion(), lockfile }), null, 2));
+      return 0;
+    }
     if (flags.json) {
       console.log(JSON.stringify({ lockfile, checked, unknown, findings }, null, 2));
     } else if (!findings.length) {
@@ -228,11 +276,39 @@ export async function main(argv = process.argv.slice(2)) {
         console.log(`${paint(RISK_COLOR[f.risk], f.risk.toUpperCase().padEnd(6))} ${paint("bold", f.name)}@${f.version}${f.dev ? paint("dim", " (dev)") : ""}`);
         for (const sc of f.scripts) console.log(`       ${paint("dim", `${sc.hook} [${sc.category}]`)} ${sc.command}`);
       }
+      if (policy.exists) reportPolicy(applied);
       if (unknown) console.log(paint("dim", `\n${unknown} version(s) could not be resolved against the registry.`));
       console.log(paint("dim", "\nthis ran before any of it executed \u2014 'installguard allow --write' to keep it that way.\n"));
     }
-    const failAt = typeof flags.ci === "string" ? flags.ci : "high";
+    const failAt = typeof flags.ci === "string" ? flags.ci : policy.failOn;
     return flags.ci && findings.some((f) => RISK_ORDER[f.risk] >= RISK_ORDER[failAt]) ? 1 : 0;
+  }
+
+  if (command === "ci") {
+    if (!flags.init) {
+      console.log(renderWorkflow({ nodeVersion: String(flags.node ?? "20") }));
+      console.log(paint("dim", `# re-run with --init to write this to ${WORKFLOW_PATH}`));
+      return 0;
+    }
+    const result = await writeWorkflow(dir, { nodeVersion: String(flags.node ?? "20"), force: !!flags.force });
+    if (!result.written) {
+      console.error(`installguard: ${WORKFLOW_PATH} already exists — pass --force to overwrite.`);
+      return 2;
+    }
+    console.log(paint("green", `✔ wrote ${result.target}`));
+    console.log(paint("dim", "it preflights before install, installs with --ignore-scripts, diffs the baseline and uploads SARIF.\n"));
+    return 0;
+  }
+
+  if (command === "policy") {
+    if (!(await hasNodeModules(dir))) {
+      console.error("installguard: no node_modules/ found — run your package manager's install first.");
+      return 2;
+    }
+    const findings = await scanTree(dir);
+    console.log(JSON.stringify(renderPolicy(findings), null, 2));
+    console.error(`\ninstallguard: pipe this into ${POLICY_FILE} and replace each reason with a real one.`);
+    return 0;
   }
 
   if (command === "why") {

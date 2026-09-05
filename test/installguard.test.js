@@ -356,3 +356,106 @@ test("why traces a transitive package back to the direct dependency that pulled 
   assert.equal(graph.versions.get("sneaky"), "4.0.0");
   assert.deepEqual(pathsTo(graph, "nonexistent"), []);
 });
+
+// ---------------------------------------------------------------------------
+// v0.4.0: policy file, SARIF output, CI workflow generator
+// ---------------------------------------------------------------------------
+
+import { normalizePolicy, applyPolicy, readPolicy, renderPolicy } from "../src/policy.js";
+import { toSarif } from "../src/sarif.js";
+import { renderWorkflow, writeWorkflow, WORKFLOW_PATH } from "../src/ci.js";
+
+const finding = (name, risk = "high", extra = {}) => ({
+  name,
+  version: "1.0.0",
+  risk,
+  path: `node_modules/${name}`,
+  scripts: [{ hook: "postinstall", command: "node install.js", category: "network-download", risk }],
+  ...extra,
+});
+
+test("policy allows reviewed packages and un-allows expired ones", () => {
+  const policy = normalizePolicy({
+    allow: {
+      esbuild: { reason: "fetches its platform binary", expires: "2027-01-01" },
+      sharp: "native build",
+      forever: true,
+    },
+  });
+  const now = new Date("2026-09-05T00:00:00Z");
+  const findings = [finding("esbuild"), finding("sharp"), finding("forever"), finding("stranger")];
+  const applied = applyPolicy(findings, policy, now);
+
+  assert.deepEqual(applied.remaining.map((f) => f.name), ["stranger"]);
+  assert.equal(applied.allowed.length, 3);
+  assert.equal(applied.allowed[0].policy.reason, "fetches its platform binary");
+  assert.equal(applied.expired.length, 0);
+
+  // Same policy, read a year later: the dated allowance stops counting.
+  const later = applyPolicy(findings, policy, new Date("2027-06-01T00:00:00Z"));
+  assert.deepEqual(later.expired.map((f) => f.name), ["esbuild"]);
+  assert.ok(later.remaining.some((f) => f.name === "esbuild" && f.policyExpired === "2027-01-01"));
+  // An undated allowance is still honoured — expiry is opt-in, not a trap.
+  assert.ok(later.allowed.some((f) => f.name === "sharp"));
+});
+
+test("policy surfaces a malformed expiry instead of silently allowing", () => {
+  const applied = applyPolicy([finding("weird")], normalizePolicy({ allow: { weird: { expires: "soon" } } }));
+  assert.equal(applied.allowed.length, 0);
+  assert.match(applied.remaining[0].policyError, /invalid expires/);
+});
+
+test("readPolicy returns usable defaults when no policy file exists", async () => {
+  const policy = await readPolicy(await mkdtemp(path.join(tmpdir(), "installguard-pol-")));
+  assert.deepEqual(policy.allow, {});
+  assert.equal(policy.failOn, "high");
+  assert.equal(policy.exists, false);
+  assert.equal(renderPolicy([finding("a")]).allow.a.reason, "reviewed");
+});
+
+test("SARIF output is well-formed and points at the offending source line", () => {
+  const deep = finding("evil");
+  deep.scripts[0].sourceFile = "install.js";
+  deep.scripts[0].evidence = [{ line: 42, category: "credential-exfil", risk: "high", text: "fetch(x + process.env.NPM_TOKEN)" }];
+
+  const sarif = toSarif([deep], { toolVersion: "0.4.0" });
+  assert.equal(sarif.version, "2.1.0");
+  const run = sarif.runs[0];
+  assert.equal(run.tool.driver.name, "installguard");
+  assert.equal(run.tool.driver.version, "0.4.0");
+  assert.deepEqual(run.tool.driver.rules.map((r) => r.id), ["installguard/network-download"]);
+
+  const [result] = run.results;
+  assert.equal(result.level, "error", "high risk must map to SARIF error");
+  assert.equal(result.locations[0].physicalLocation.artifactLocation.uri, "node_modules/evil/package.json");
+  assert.equal(result.locations[1].physicalLocation.region.startLine, 42);
+  assert.equal(result.locations[1].physicalLocation.artifactLocation.uri, "node_modules/evil/install.js");
+  assert.ok(result.partialFingerprints.installguardHook.includes("evil:postinstall"));
+  // Every ruleId must resolve to a declared rule, or GitHub rejects the upload.
+  const declared = new Set(run.tool.driver.rules.map((r) => r.id));
+  assert.ok(run.results.every((r) => declared.has(r.ruleId)));
+
+  assert.equal(toSarif([finding("m", "medium")]).runs[0].results[0].level, "warning");
+  assert.equal(toSarif([]).runs[0].results.length, 0);
+});
+
+test("ci --init writes a workflow that preflights before installing, and never clobbers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "installguard-ci-"));
+  const first = await writeWorkflow(dir, { nodeVersion: "22" });
+  assert.equal(first.written, true);
+
+  const yml = await readFile(path.join(dir, WORKFLOW_PATH), "utf8");
+  assert.match(yml, /node-version: "22"/);
+  assert.match(yml, /security-events: write/);
+  assert.ok(
+    yml.indexOf("installguard preflight --ci") < yml.indexOf("npm ci --ignore-scripts"),
+    "preflight must run before anything is installed",
+  );
+  assert.match(yml, /upload-sarif@v3/);
+
+  const second = await writeWorkflow(dir, {});
+  assert.equal(second.written, false);
+  assert.equal(second.reason, "exists");
+  assert.equal((await writeWorkflow(dir, { force: true })).written, true);
+  assert.ok(!renderWorkflow({ sarif: false }).includes("upload-sarif"));
+});

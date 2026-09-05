@@ -7,4 +7,7 @@ export { referencedScriptFile, classifySource, inspectFinding, inspectFindings }
 export { preflight } from "./preflight.js";
 export { buildGraph, pathsTo, blameDirect } from "./graph.js";
 export { createRegistry, mapLimit } from "./registry.js";
+export { readPolicy, normalizePolicy, applyPolicy, renderPolicy, POLICY_FILE } from "./policy.js";
+export { toSarif } from "./sarif.js";
+export { renderWorkflow, writeWorkflow, WORKFLOW_PATH } from "./ci.js";
 export { main, parseArgs } from "./cli.js";

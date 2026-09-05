@@ -21,6 +21,7 @@ npx installguard accept             # record today's hooks as reviewed
 npx installguard diff --ci          # in CI: fail only when that changes
 npx installguard cooldown --days 7  # flag versions published minutes ago
 npx installguard why left-pad       # which direct dep dragged that in
+npx installguard ci --init          # generate the GitHub Actions workflow
 ```
 
 ## Commands
@@ -140,6 +141,54 @@ CHANGE esbuild@0.28.2 (script, risk; was 0.28.2)
        postinstall was node install.js
        postinstall [obfuscated-exec] node -e "eval(atob('…'))"
 ```
+
+### Policy: `.installguardrc.json`
+
+An allow-list without a reason is a shrug, and one without an expiry becomes permanent by
+accident. So exceptions are recorded with both:
+
+```json
+{
+  "allow": {
+    "esbuild": { "reason": "fetches its own platform binary; reviewed by @sam", "expires": "2026-12-01" },
+    "sharp": "native build"
+  },
+  "failOn": "high"
+}
+```
+
+Allowed packages drop out of `scan`, `diff` and `preflight`. An **expired** allowance does not
+silently keep passing — it comes back as a finding and says so:
+
+```
+! allowance for esbuild expired on 2026-12-01 — re-review or extend it.
+```
+
+`installguard policy` prints a starter file from your current tree. An undated allowance stays
+valid; expiry is opt-in, not a trap.
+
+### SARIF: `--sarif`
+
+`scan --sarif` and `preflight --sarif` emit SARIF 2.1.0 (validated against the official
+schema), so findings land in GitHub's **Security** tab with annotations on the exact line of
+the install script rather than scrolling past in a CI log.
+
+```bash
+installguard scan --sarif > installguard.sarif
+```
+
+### `installguard ci --init`
+
+Writes `.github/workflows/installguard.yml` — the workflow in the right order:
+
+1. `preflight --ci` **before** anything is installed
+2. `npm ci --ignore-scripts`
+3. `diff --ci` against the accepted baseline
+4. `cooldown --days 3`
+5. SARIF upload to the Security tab
+
+Run without `--init` to print it instead; it will not overwrite an existing file without
+`--force`.
 
 ### `installguard cooldown [--days 7]`
 
