@@ -1,19 +1,14 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { parseNpmLock } from "./lockfiles.js";
+
+export { readAnyLock } from "./lockfiles.js";
 
 const REGISTRY = process.env.INSTALLGUARD_REGISTRY || "https://registry.npmjs.org";
 
 /** Read name@version pairs from npm's package-lock.json (v2/v3). */
 export async function readLockVersions(projectDir) {
-  const lock = JSON.parse(await readFile(path.join(projectDir, "package-lock.json"), "utf8"));
-  const out = new Map();
-  for (const [key, entry] of Object.entries(lock.packages ?? {})) {
-    if (!key || !entry?.version) continue;
-    const name = entry.name ?? key.split("node_modules/").pop();
-    if (!name) continue;
-    out.set(`${name}@${entry.version}`, { name, version: entry.version, dev: !!entry.dev });
-  }
-  return [...out.values()];
+  return parseNpmLock(await readFile(path.join(projectDir, "package-lock.json"), "utf8"));
 }
 
 /** Fetch the publish timestamp of a specific version from the registry. */

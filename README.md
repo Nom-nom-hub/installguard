@@ -13,9 +13,11 @@ it leaves you with are still manual:
 `installguard` answers both, in one zero-dependency CLI.
 
 ```bash
-npx installguard scan
-npx installguard allow --write
-npx installguard cooldown --days 7
+npx installguard scan               # what runs code at install time
+npx installguard allow --write      # block it all except genuine native builds
+npx installguard accept             # record today's hooks as reviewed
+npx installguard diff --ci          # in CI: fail only when that changes
+npx installguard cooldown --days 7  # flag versions published minutes ago
 ```
 
 ## Commands
@@ -40,6 +42,9 @@ summary: 1 high · 1 medium · 1 low
 
 | Category | Meaning | Risk |
 | --- | --- | --- |
+| `pipe-to-shell` | `curl … \| sh` — download and execute in one step | high |
+| `obfuscated-exec` | `eval`, `atob`, `Buffer.from(…, 'base64')`, `child_process`, `node -e` | high |
+| `credential-exfil` | touches `process.env` / `.npmrc` / ssh keys *and* the network | high |
 | `network-download` | fetches something from the internet at install time | high |
 | `shell-exec` | pipes to a shell, `eval`, `chmod`, `sudo` | high |
 | `native-build` | node-gyp / prebuild / cmake-js — a real compile step | medium |
@@ -56,9 +61,32 @@ builds**. `--write` applies it — `ignore-scripts=true` in `.npmrc` and
 `pnpm.onlyBuiltDependencies` in `package.json` (idempotent, keeps the rest of your file intact).
 `--json` also prints ready-to-paste npm / pnpm / yarn config.
 
+### `installguard accept` + `installguard diff`
+
+Volume is not signal. A large project legitimately has install hooks, and a tool that
+reprints all of them every build gets muted within a week. So: review them once, record
+them, and from then on report only what *changed*.
+
+```bash
+installguard accept          # writes .installguard.json — commit it
+installguard diff --ci       # exit 1 on new or modified install scripts
+```
+
+`diff` catches a package that gains a hook it never had, and a package whose existing hook
+was rewritten — which is exactly what a hijacked release looks like:
+
+```
+0 new · 1 changed install script(s)
+
+CHANGE esbuild@0.28.2 (script, risk; was 0.28.2)
+       postinstall was node install.js
+       postinstall [obfuscated-exec] node -e "eval(atob('…'))"
+```
+
 ### `installguard cooldown [--days 7]`
 
-Reads `package-lock.json`, asks the registry when each locked version was published, and flags
+Reads your lockfile — `package-lock.json`, `pnpm-lock.yaml` or `yarn.lock` (classic and berry) —
+asks the registry when each locked version was published, and flags
 anything younger than the cooldown window — the period in which a hijacked publish is usually
 still live and unreported.
 
@@ -75,7 +103,7 @@ Use `--ci` to fail a pipeline on fresh releases, or `--json` to feed it into you
 
 ```yaml
 - run: npm ci --ignore-scripts
-- run: npx installguard scan --ci
+- run: npx installguard diff --ci
 - run: npx installguard cooldown --days 3 --ci
 ```
 

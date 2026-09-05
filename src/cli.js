@@ -4,7 +4,9 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { scanTree, hasNodeModules, RISK_ORDER } from "./scan.js";
 import { buildAllowList, renderConfig, writeConfig } from "./allow.js";
-import { readLockVersions, checkCooldown } from "./cooldown.js";
+import { checkCooldown } from "./cooldown.js";
+import { readAnyLock } from "./lockfiles.js";
+import { readBaseline, writeBaseline, diffBaseline, BASELINE_FILE } from "./baseline.js";
 
 const C = {
   reset: "\u001b[0m",
@@ -41,15 +43,21 @@ Usage
   installguard scan      [--json] [--ci] [--min-risk low|medium|high] [--dir <path>]
   installguard allow     [--write] [--json] [--dir <path>]
   installguard cooldown  [--days 7] [--json] [--ci] [--dir <path>]
+  installguard diff      [--json] [--ci] [--dir <path>]
+  installguard accept    [--dir <path>]
 
 Commands
   scan      List every dependency with a pre/install/postinstall hook, classified by risk.
   allow     Generate a minimal install-script allow-list (--write applies it).
-  cooldown  Flag installed versions published in the last N days (fresh-release risk window).
+  cooldown  Flag locked versions published in the last N days (fresh-release risk window).
+  diff      Compare the tree against your accepted baseline — new/changed install scripts only.
+  accept    Record the current install scripts as reviewed (writes .installguard.json).
 
 Flags
   --ci      Exit 1 when findings are at or above the threshold (default: high).
   --json    Machine-readable output.
+
+Typical use: 'accept' once, then 'diff --ci' in CI so you are alerted on change, not volume.
 `;
 
 function printScan(findings, minRisk) {
@@ -117,22 +125,64 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
+  if (command === "diff" || command === "accept") {
+    if (!(await hasNodeModules(dir))) {
+      console.error("installguard: no node_modules/ found — run your package manager's install first.");
+      return 2;
+    }
+    const findings = await scanTree(dir);
+    if (command === "accept") {
+      const target = await writeBaseline(dir, findings);
+      console.log(paint("green", `✔ baseline written: ${target} (${findings.length} package(s) accepted)`));
+      console.log(paint("dim", "commit it, then run `installguard diff --ci` in CI to be alerted on change only.\n"));
+      return 0;
+    }
+    const baseline = await readBaseline(dir);
+    if (!baseline) {
+      console.error(`installguard: no ${BASELINE_FILE} found — run \`installguard accept\` first.`);
+      return 2;
+    }
+    const { added, changed, removed } = diffBaseline(findings, baseline);
+    if (flags.json) {
+      console.log(JSON.stringify({ added, changed, removed }, null, 2));
+    } else if (!added.length && !changed.length) {
+      console.log(paint("green", `✔ no new or modified install scripts (${findings.length} accepted, ${removed.length} gone).`));
+    } else {
+      console.log(paint("bold", `\n${added.length} new · ${changed.length} changed install script(s)\n`));
+      for (const f of added) {
+        console.log(`${paint(RISK_COLOR[f.risk], "NEW   ")} ${paint("bold", f.name)}@${f.version ?? "?"}`);
+        for (const sc of f.scripts) console.log(`       ${paint("dim", `${sc.hook} [${sc.category}]`)} ${sc.command}`);
+      }
+      for (const f of changed) {
+        console.log(`${paint(RISK_COLOR[f.risk], "CHANGE")} ${paint("bold", f.name)}@${f.version ?? "?"} ${paint("dim", `(${f.reasons.join(", ")}; was ${f.previous.version ?? "?"})`)}`);
+        for (const sc of f.scripts) {
+          const before = f.previous.scripts?.[sc.hook];
+          if (before && before !== sc.command) console.log(`       ${paint("dim", `${sc.hook} was`)} ${before}`);
+          console.log(`       ${paint("dim", `${sc.hook} [${sc.category}]`)} ${sc.command}`);
+        }
+      }
+      console.log(paint("dim", "\nreview, then `installguard accept` to re-baseline.\n"));
+    }
+    return flags.ci && (added.length || changed.length) ? 1 : 0;
+  }
+
   if (command === "cooldown") {
     const days = Number(flags.days ?? 7);
     let deps;
+    let lockfile;
     try {
-      deps = await readLockVersions(dir);
+      ({ deps, lockfile } = await readAnyLock(dir));
     } catch {
-      console.error("installguard: package-lock.json not found (cooldown needs an npm lockfile).");
+      console.error("installguard: no lockfile found (package-lock.json, pnpm-lock.yaml or yarn.lock).");
       return 2;
     }
     const flagged = await checkCooldown(deps, { days });
     if (flags.json) {
-      console.log(JSON.stringify({ days, checked: deps.length, flagged }, null, 2));
+      console.log(JSON.stringify({ days, lockfile, checked: deps.length, flagged }, null, 2));
     } else if (!flagged.length) {
-      console.log(paint("green", `✔ none of ${deps.length} locked versions were published in the last ${days} day(s).`));
+      console.log(paint("green", `✔ none of ${deps.length} versions in ${lockfile} were published in the last ${days} day(s).`));
     } else {
-      console.log(paint("bold", `\n${flagged.length} of ${deps.length} locked versions are younger than ${days} day(s)\n`));
+      console.log(paint("bold", `\n${flagged.length} of ${deps.length} versions in ${lockfile} are younger than ${days} day(s)\n`));
       for (const f of flagged) {
         console.log(`${paint("yellow", `${f.ageHours}h`.padStart(6))}  ${f.name}@${f.version} ${paint("dim", f.published)}`);
       }
