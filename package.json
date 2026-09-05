@@ -1,0 +1,15 @@
+{
+  "name": "installguard",
+  "version": "0.1.0",
+  "description": "See and control what runs code when you npm install — classify install scripts, generate a minimal allow-list, and flag brand-new dependency releases.",
+  "type": "module",
+  "bin": { "installguard": "./src/cli.js" },
+  "exports": { ".": "./src/index.js" },
+  "files": ["src", "README.md", "LICENSE"],
+  "engines": { "node": ">=18.17" },
+  "scripts": { "test": "node --test \"test/*.test.js\"" },
+  "keywords": ["npm", "security", "supply-chain", "postinstall", "install-scripts", "cli", "audit", "ignore-scripts"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Nom-nom-hub/installguard.git" },
+  "author": "Nom-nom-hub"
+}
