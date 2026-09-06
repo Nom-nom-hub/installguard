@@ -25,7 +25,12 @@ export function parseNpmLock(text) {
   for (const [key, entry] of Object.entries(lock.packages ?? {})) {
     if (!key || !entry?.version) continue;
     const name = entry.name ?? key.split("node_modules/").pop();
-    entries.push({ name, version: entry.version, dev: !!entry.dev });
+    // Git-sourced dependencies are a separate hazard: npm runs their `prepare`
+    // script (registry tarballs never get one), and the ref they point at can be
+    // rewritten upstream without the version ever changing.
+    const resolved = typeof entry.resolved === "string" ? entry.resolved : null;
+    const git = !!resolved && /^git\+|^github:|^git:/.test(resolved);
+    entries.push({ name, version: entry.version, dev: !!entry.dev, resolved, git });
   }
   // lockfileVersion 1 fallback
   for (const [name, entry] of Object.entries(lock.dependencies ?? {})) {

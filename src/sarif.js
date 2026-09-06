@@ -7,10 +7,13 @@ const RULE_TEXT = {
   "obfuscated-exec": "Install hook evaluates code at runtime (eval/atob/base64/child_process).",
   "credential-exfil": "Install hook reads credentials or environment and contacts the network.",
   "network-download": "Install hook fetches content from the internet.",
+  "download-exec": "Install hook downloads content and executes a process in the same script.",
+  "env-read": "Install hook reads a sensitive environment variable.",
   "shell-exec": "Install hook shells out.",
   "path-escape": "Install hook points at a file outside its own package directory.",
   "native-build": "Install hook performs a native compile step.",
   "script-exec": "Install hook runs a JavaScript file from the package.",
+  "git-dependency": "Dependency is installed from git, so its prepare script runs on install and its ref can change under you.",
   "funding-nag": "Install hook prints a funding message.",
   other: "Install hook runs an unrecognised command.",
 };

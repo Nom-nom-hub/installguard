@@ -4,13 +4,18 @@ import path from "node:path";
 const HOOKS = ["preinstall", "install", "postinstall"];
 
 const NATIVE_RE = /node-gyp|node-pre-gyp|prebuild-install|prebuildify|cmake-js|neon |cargo |napi build/i;
-const DOWNLOAD_RE = /curl|wget|https?:\/\/|download|fetch .*http/i;
+// "download" as a bare word matched identifiers like `downloadedBinPath`; require
+// an actual fetching tool or a URL.
+const DOWNLOAD_RE = /(^|[^\w.-])(curl|wget)\b|https?:\/\/|\bfetch\s+http/i;
 const NAG_RE = /opencollective|funding|thanks|postinstall-?(ad|nag)|donate/i;
 const SHELL_RE = /(^|[;&|`])\s*(sh|bash|eval|chmod|sudo)\b|\$\(/i;
 
 // Patterns seen in real supply-chain payloads (chalk/debug, Shai-Hulud): code smuggled
 // through an eval/base64 hop, or the environment read and shipped somewhere.
-const OBFUSCATED_RE = /\b(eval|atob|Function\s*\(|Buffer\.from\s*\([^)]*base64|child_process|vm\.runIn)/i;
+const OBFUSCATED_RE = /(^|[^\w.$])(eval|atob)\s*\(|(^|[^\w.$])(new\s+)?Function\s*\(|Buffer\.from\s*\([^)]*base64|vm\.runIn/;
+// child_process in a command string is execution, not obfuscation — a distinction
+// worth keeping: mislabelling it as obfuscation cost a false HIGH on @parcel/watcher.
+const CHILD_PROCESS_RE = /child_process/;
 const EXFIL_RE = /process\.env|~\/\.(npmrc|aws|ssh)|\.npmrc|id_rsa|NPM_TOKEN|GITHUB_TOKEN|AWS_SECRET/i;
 const PIPE_TO_SHELL_RE = /(curl|wget)[^|]*\|\s*(sudo\s+)?(ba)?sh/i;
 const NODE_EVAL_RE = /\bnode\s+(-e|--eval|-p\b)/i;
@@ -29,7 +34,7 @@ export function classifyScript(cmd) {
   if (OBFUSCATED_RE.test(c) || NODE_EVAL_RE.test(c)) return { category: "obfuscated-exec", risk: "high" };
   if (NATIVE_RE.test(c)) return { category: "native-build", risk: "medium" };
   if (DOWNLOAD_RE.test(c)) return { category: "network-download", risk: "high" };
-  if (SHELL_RE.test(c)) return { category: "shell-exec", risk: "high" };
+  if (SHELL_RE.test(c) || CHILD_PROCESS_RE.test(c)) return { category: "shell-exec", risk: "high" };
   if (NAG_RE.test(c)) return { category: "funding-nag", risk: "low" };
   if (/^node\b|^\.\/|\.js\b|\.cjs\b|\.mjs\b/.test(c.trim())) return { category: "script-exec", risk: "medium" };
   return { category: "other", risk: "medium" };

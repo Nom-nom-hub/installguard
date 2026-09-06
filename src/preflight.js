@@ -17,7 +17,12 @@ export async function preflight(
   deps,
   { concurrency = 8, fetchImpl = fetch, registry = createRegistry({ fetchImpl }), onProgress } = {},
 ) {
-  const names = [...new Set(deps.map((d) => d.name))];
+  // Git dependencies cannot be asked about — the registry has never seen them.
+  // They are reported directly, because `prepare` runs on install for exactly
+  // these and for nothing else.
+  const gitDeps = deps.filter((d) => d.git);
+  const registryDeps = deps.filter((d) => !d.git);
+  const names = [...new Set(registryDeps.map((d) => d.name))];
   const flagsByName = new Map();
 
   await mapLimit(names, concurrency, async (name) => {
@@ -28,7 +33,7 @@ export async function preflight(
 
   const candidates = [];
   let unknown = 0;
-  for (const dep of deps) {
+  for (const dep of registryDeps) {
     const versions = flagsByName.get(dep.name);
     if (!versions) {
       unknown++;
@@ -52,6 +57,18 @@ export async function preflight(
     return { name: dep.name, version: dep.version, dev: !!dep.dev, risk, scripts, scriptsKnown: scripts.length > 0 };
   });
 
+  for (const dep of gitDeps) {
+    findings.push({
+      name: dep.name,
+      version: dep.version,
+      dev: !!dep.dev,
+      risk: "medium",
+      git: dep.resolved,
+      scripts: [{ hook: "prepare", command: `git dependency (${dep.resolved})`, category: "git-dependency", risk: "medium" }],
+      scriptsKnown: false,
+    });
+  }
+
   findings.sort((a, b) => RISK_ORDER[b.risk] - RISK_ORDER[a.risk] || a.name.localeCompare(b.name));
-  return { checked: deps.length, unknown, findings };
+  return { checked: deps.length, unknown, git: gitDeps.length, findings };
 }

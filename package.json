@@ -1,6 +1,6 @@
 {
   "name": "installguard",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "See and control what runs code when you npm install \u2014 classify install scripts, generate a minimal allow-list, and flag brand-new dependency releases.",
   "type": "module",
   "bin": {

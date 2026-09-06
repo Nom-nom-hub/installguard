@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { classifyScript, RISK_ORDER } from "./scan.js";
+import { RISK_ORDER } from "./scan.js";
+import { classifySourceFile } from "./source.js";
 
 const MAX_BYTES = 512 * 1024;
 
@@ -21,26 +22,17 @@ export function referencedScriptFile(command) {
  *
  * This is the gap that matters: nearly every real hook reads `node install.js`,
  * which the command-line classifier can only ever call "script-exec, medium".
- * The payload lives in the file, so that is where we look.
+ * The payload lives in the file, so that is where we look. The line-level rules
+ * live in source.js, kept deliberately stricter than the command-level ones.
  */
 export function classifySource(source) {
-  const evidence = [];
-  const lines = source.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim() || line.trim().startsWith("//")) continue;
-    const { category, risk } = classifyScript(line);
-    if (risk === "high") {
-      evidence.push({ line: i + 1, category, risk, text: line.trim().slice(0, 160) });
-    }
-  }
-  // A minified or packed file is itself a signal: install scripts have no reason to be one.
-  const longest = lines.reduce((max, l) => Math.max(max, l.length), 0);
-  if (longest > 2000 && lines.length < 25) {
-    evidence.push({ line: 1, category: "obfuscated-exec", risk: "high", text: `single ${longest}-char line (packed/minified source)` });
-  }
-  const risk = evidence.length ? "high" : "medium";
-  return { risk, evidence: evidence.slice(0, 5), evidenceCount: evidence.length };
+  const result = classifySourceFile(source);
+  return {
+    risk: result.risk,
+    evidence: [...result.combos, ...result.evidence].slice(0, 5),
+    evidenceCount: result.evidenceCount + result.combos.length,
+    categories: result.categories,
+  };
 }
 
 /**
@@ -80,7 +72,10 @@ export async function inspectFinding(projectDir, finding) {
       evidence: deep.evidence,
       evidenceCount: deep.evidenceCount,
     };
-    if (RISK_ORDER[deep.risk] > RISK_ORDER[script.risk]) {
+    // Only genuine high-risk source evidence changes the verdict. A medium
+    // signal (a spawn, a URL) is attached for the reader but does not inflate
+    // the score — that is how a scanner turns into background noise.
+    if (deep.risk === "high" && RISK_ORDER[deep.risk] > RISK_ORDER[script.risk]) {
       merged.risk = deep.risk;
       merged.category = deep.evidence[0]?.category ?? script.category;
     }

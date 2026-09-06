@@ -142,6 +142,44 @@ CHANGE esbuild@0.28.2 (script, risk; was 0.28.2)
        postinstall [obfuscated-exec] node -e "eval(atob('…'))"
 ```
 
+### Accuracy — measured, not asserted
+
+A scanner that cries wolf gets uninstalled on day one, so the classifier is validated against
+real dependency trees rather than a demo project: **476 unique packages** across seven typical
+stacks (Next.js/React, Vite, NestJS, Playwright, webpack/rollup/esbuild/TypeScript,
+eslint/prettier/jest, sharp/canvas).
+
+| | |
+| --- | --- |
+| Packages scanned | 476 |
+| Packages that run code on install | 4 |
+| Reported high risk | 1 (`esbuild` — downloads and executes its platform binary; true) |
+| Reported medium | 3 (`@parcel/watcher`, `unrs-resolver`, `canvas` — all genuine build hooks) |
+| False positives | 0 |
+
+That run is also what produced this release. The first version of the deep classifier reused
+the *command* rules on *source code*, and rated `@parcel/watcher` **high** because
+`function (code) {` matched a `Function()` constructor pattern, and `esbuild` **credential
+exfiltration** because it reads `ESBUILD_BINARY_PATH`. Both are wrong, and both are now
+regression tests. The rule that came out of it: match on what the code *does* — a call, a
+`require`, a literal URL — never on a word inside an identifier.
+
+Detection was checked in the same pass against seven published attack shapes (the chalk/debug
+token steal, a Shai-Hulud style `.npmrc` read, `curl | sh`, base64/`atob` droppers, packed
+one-liners): **7 of 7 still flagged high**. Both halves are in the test suite, because tuning
+away noise is only progress if the real thing still trips it.
+
+### What is *not* reported, deliberately
+
+`prepare` and `prepublish` scripts in a registry dependency **do not run on install** — npm
+runs `prepare` for the root project and for git dependencies only. Around 40% of the packages
+in the corpus above declare one (`husky`, `tshy`, `npm run build`), and reporting them would
+have buried the four findings that matter under a hundred that don't.
+
+The exception is real, so it is handled: a dependency resolved from **git** does run `prepare`,
+and its ref can be rewritten upstream without the version changing. `preflight` reports those
+separately as `git-dependency`.
+
 ### Policy: `.installguardrc.json`
 
 An allow-list without a reason is a shrug, and one without an expiry becomes permanent by
